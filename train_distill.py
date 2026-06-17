@@ -102,11 +102,8 @@ class UnlabeledImageDataset(Dataset):
     Uses a fixed square resize (default 518 = 37 x 14) so samples can be batched.
     """
 
-    def __init__(self, data_dir, input_size=518):
-        self.files = sorted(
-            f for f in glob.glob(os.path.join(data_dir, '**', '*'), recursive=True)
-            if f.lower().endswith(IMG_EXTS)
-        )
+    def __init__(self, data_dir, input_size=518, cache_path=None, rebuild_cache=False):
+        self.files = self._load_file_list(data_dir, cache_path, rebuild_cache)
         if not self.files:
             raise FileNotFoundError(f'No images found under {data_dir}')
 
@@ -123,6 +120,32 @@ class UnlabeledImageDataset(Dataset):
             NormalizeImage(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
             PrepareForNet(),
         ])
+
+    @staticmethod
+    def _load_file_list(data_dir, cache_path, rebuild_cache):
+        """Return the image-file list, caching it to disk so the slow recursive
+        scan of a large dataset (e.g. OpenImages) only runs once."""
+        if cache_path is None:
+            cache_path = os.path.join(data_dir, '.dav2_filelist.txt')
+
+        if os.path.exists(cache_path) and not rebuild_cache:
+            with open(cache_path) as f:
+                files = [line.rstrip('\n') for line in f if line.strip()]
+            print(f'Loaded {len(files)} image paths from cache {cache_path}')
+            return files
+
+        print(f'Scanning {data_dir} for images (first run; will be cached)...')
+        files = sorted(
+            f for f in glob.glob(os.path.join(data_dir, '**', '*'), recursive=True)
+            if f.lower().endswith(IMG_EXTS)
+        )
+        try:
+            with open(cache_path, 'w') as f:
+                f.write('\n'.join(files))
+            print(f'Cached {len(files)} image paths to {cache_path}')
+        except OSError as e:                         # e.g. read-only dataset dir
+            print(f'Could not write file-list cache ({e}); continuing without cache')
+        return files
 
     def __len__(self):
         return len(self.files)
@@ -223,6 +246,9 @@ def build_model(encoder, ckpt, device):
 def parse_args():
     p = argparse.ArgumentParser(description='Depth Anything V2 distillation')
     p.add_argument('--data-dir', type=str, required=True, help='directory of unlabeled images')
+    p.add_argument('--filelist-cache', type=str, default=None,
+                   help='path to cache the scanned image list (default: <data-dir>/.dav2_filelist.txt)')
+    p.add_argument('--rebuild-filelist', action='store_true', help='force a rescan, ignoring any cache')
     p.add_argument('--teacher-encoder', type=str, default='vitl', choices=list(MODEL_CONFIGS))
     p.add_argument('--student-encoder', type=str, default='vits', choices=list(MODEL_CONFIGS))
     p.add_argument('--teacher-ckpt', type=str, required=True)
@@ -240,6 +266,8 @@ def parse_args():
     p.add_argument('--log-every', type=int, default=50)
     p.add_argument('--save-path', type=str, default='exp/distill')
     p.add_argument('--amp', action='store_true', help='mixed precision (CUDA only)')
+    p.add_argument('--amp-dtype', type=str, default='bf16', choices=['bf16', 'fp16'],
+                   help='autocast dtype when --amp is set (bf16 needs Ampere+; avoids GradScaler)')
     return p.parse_args()
 
 
@@ -250,7 +278,10 @@ def main():
     device = 'cuda' if torch.cuda.is_available() else \
              'mps' if torch.backends.mps.is_available() else 'cpu'
     use_amp = args.amp and device == 'cuda'
-    print(f'Device: {device} | AMP: {use_amp}')
+    amp_dtype = torch.bfloat16 if args.amp_dtype == 'bf16' else torch.float16
+    # GradScaler is only needed for fp16; bf16 has fp32 range and doesn't require it.
+    use_scaler = use_amp and amp_dtype == torch.float16
+    print(f'Device: {device} | AMP: {use_amp} ({args.amp_dtype if use_amp else "off"})')
 
     # Teacher: frozen, eval.
     teacher = build_model(args.teacher_encoder, args.teacher_ckpt, device).eval()
@@ -264,9 +295,12 @@ def main():
         print(f'Quantized {n} linear layers in the student DINOv2 encoder -> BitLinear')
     student.train()
 
+    dataset = UnlabeledImageDataset(
+        args.data_dir, args.input_size,
+        cache_path=args.filelist_cache, rebuild_cache=args.rebuild_filelist,
+    )
     loader = DataLoader(
-        UnlabeledImageDataset(args.data_dir, args.input_size),
-        batch_size=args.bs, shuffle=True, num_workers=args.num_workers,
+        dataset, batch_size=args.bs, shuffle=True, num_workers=args.num_workers,
         pin_memory=True, drop_last=True,
     )
     print(f'Training images: {len(loader.dataset)} | steps/epoch: {len(loader)}')
@@ -278,7 +312,7 @@ def main():
     )
     total_steps = args.max_steps or args.epochs * len(loader)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_steps)
-    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+    scaler = torch.cuda.amp.GradScaler(enabled=use_scaler)
 
     step = 0
     loss_log = []                                  # (step, loss) for every optimizer step
@@ -286,10 +320,10 @@ def main():
         for batch in loader:
             x = batch.to(device, non_blocking=True)
 
-            with torch.no_grad(), torch.autocast(device_type='cuda', enabled=use_amp):
+            with torch.no_grad(), torch.autocast(device_type='cuda', dtype=amp_dtype, enabled=use_amp):
                 target = teacher(x)
 
-            with torch.autocast(device_type='cuda', enabled=use_amp):
+            with torch.autocast(device_type='cuda', dtype=amp_dtype, enabled=use_amp):
                 pred = student(x)
                 loss = criterion(pred, target)
 
