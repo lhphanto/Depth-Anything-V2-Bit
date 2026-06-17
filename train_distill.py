@@ -181,6 +181,38 @@ class AffineInvariantDistillLoss(nn.Module):
 # --------------------------------------------------------------------------------------
 # Training
 # --------------------------------------------------------------------------------------
+def plot_loss(loss_log, save_path):
+    """Plot the per-step losses (kept in memory) as a loss curve."""
+    try:
+        import matplotlib
+        matplotlib.use('Agg')                      # headless / no display needed
+        import matplotlib.pyplot as plt
+    except ImportError:
+        print('matplotlib not available; skipping loss plot')
+        return
+
+    steps = [s for s, _ in loss_log]
+    losses = [l for _, l in loss_log]
+    plt.figure(figsize=(8, 5))
+    plt.plot(steps, losses, linewidth=0.8, alpha=0.6, label='loss')
+    # Running mean to show the trend through the step-to-step noise.
+    window = max(1, len(losses) // 100)
+    if window > 1:
+        smooth = [sum(losses[max(0, i - window + 1):i + 1]) /
+                  len(losses[max(0, i - window + 1):i + 1]) for i in range(len(losses))]
+        plt.plot(steps, smooth, color='C3', linewidth=1.8, label=f'running mean ({window})')
+    plt.xlabel('step')
+    plt.ylabel('distillation loss')
+    plt.title('Training loss')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    png_path = os.path.join(save_path, 'loss_curve.png')
+    plt.savefig(png_path, dpi=150)
+    plt.close()
+    print(f'Saved {png_path}')
+
+
 def build_model(encoder, ckpt, device):
     model = DepthAnythingV2(**MODEL_CONFIGS[encoder])
     if ckpt:
@@ -201,6 +233,7 @@ def parse_args():
     p.add_argument('--lr', type=float, default=5e-6)
     p.add_argument('--weight-decay', type=float, default=0.01)
     p.add_argument('--epochs', type=int, default=1)
+    p.add_argument('--save-every-epochs', type=int, default=2, help='checkpoint cadence in epochs')
     p.add_argument('--max-steps', type=int, default=0, help='stop early after N optimizer steps (0 = no limit)')
     p.add_argument('--grad-weight', type=float, default=0.5)
     p.add_argument('--num-workers', type=int, default=8)
@@ -248,6 +281,7 @@ def main():
     scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
 
     step = 0
+    loss_log = []                                  # (step, loss) for every optimizer step
     for epoch in range(args.epochs):
         for batch in loader:
             x = batch.to(device, non_blocking=True)
@@ -265,6 +299,7 @@ def main():
             scaler.update()
             scheduler.step()
             step += 1
+            loss_log.append((step, loss.item()))
 
             if step % args.log_every == 0:
                 lr = scheduler.get_last_lr()[0]
@@ -274,9 +309,11 @@ def main():
             if args.max_steps and step >= args.max_steps:
                 break
 
-        ckpt_path = os.path.join(args.save_path, f'student_epoch{epoch}.pth')
-        torch.save(student.state_dict(), ckpt_path)
-        print(f'Saved {ckpt_path}')
+        # Checkpoint every `save_every_epochs` epochs (and on the last epoch).
+        if (epoch + 1) % args.save_every_epochs == 0 or epoch == args.epochs - 1:
+            ckpt_path = os.path.join(args.save_path, f'student_epoch{epoch + 1}.pth')
+            torch.save(student.state_dict(), ckpt_path)
+            print(f'Saved {ckpt_path}')
 
         if args.max_steps and step >= args.max_steps:
             break
@@ -284,6 +321,8 @@ def main():
     final = os.path.join(args.save_path, 'student_final.pth')
     torch.save(student.state_dict(), final)
     print(f'Done. Final student: {final}')
+
+    plot_loss(loss_log, args.save_path)
 
 
 if __name__ == '__main__':
