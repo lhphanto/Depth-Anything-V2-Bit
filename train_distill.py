@@ -313,7 +313,7 @@ def main():
     )
     total_steps = args.max_steps or args.epochs * len(loader)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_steps)
-    scaler = torch.cuda.amp.GradScaler(enabled=use_scaler)
+    scaler = torch.amp.GradScaler('cuda', enabled=use_scaler)
 
     step = 0
     loss_log = []                                  # (step, loss) for every optimizer step
