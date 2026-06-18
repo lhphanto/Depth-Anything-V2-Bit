@@ -264,6 +264,7 @@ def parse_args():
     p.add_argument('--max-steps', type=int, default=0, help='stop early after N optimizer steps (0 = no limit)')
     p.add_argument('--grad-weight', type=float, default=0.5)
     p.add_argument('--num-workers', type=int, default=8)
+    p.add_argument('--prefetch-factor', type=int, default=4, help='batches prefetched per worker')
     p.add_argument('--log-every', type=int, default=50)
     p.add_argument('--save-path', type=str, default='exp/distill')
     p.add_argument('--amp', action='store_true', help='mixed precision (CUDA only)')
@@ -303,6 +304,8 @@ def main():
     loader = DataLoader(
         dataset, batch_size=args.bs, shuffle=True, num_workers=args.num_workers,
         pin_memory=True, drop_last=True,
+        persistent_workers=args.num_workers > 0,   # don't respawn workers each epoch
+        prefetch_factor=args.prefetch_factor if args.num_workers > 0 else None,
     )
     print(f'Training images: {len(loader.dataset)} | steps/epoch: {len(loader)}')
 
