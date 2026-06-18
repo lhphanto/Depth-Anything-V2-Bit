@@ -23,6 +23,7 @@ Example
 import argparse
 import glob
 import os
+import time
 
 import cv2
 import torch
@@ -316,6 +317,7 @@ def main():
 
     step = 0
     loss_log = []                                  # (step, loss) for every optimizer step
+    t_log = time.perf_counter()                    # wall-clock anchor for step timing
     for epoch in range(args.epochs):
         for batch in loader:
             x = batch.to(device, non_blocking=True)
@@ -337,8 +339,13 @@ def main():
 
             if step % args.log_every == 0:
                 lr = scheduler.get_last_lr()[0]
+                now = time.perf_counter()
+                ms_per_step = (now - t_log) / args.log_every * 1000
+                img_per_s = args.bs / (ms_per_step / 1000)
+                t_log = now
                 print(f'epoch {epoch} step {step}/{total_steps} '
-                      f'loss {loss.item():.4f} lr {lr:.2e}')
+                      f'loss {loss.item():.4f} lr {lr:.2e} '
+                      f'{ms_per_step:.0f} ms/step {img_per_s:.1f} img/s')
 
             if args.max_steps and step >= args.max_steps:
                 break
