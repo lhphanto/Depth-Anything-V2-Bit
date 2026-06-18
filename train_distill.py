@@ -22,10 +22,12 @@ Example
 
 import argparse
 import glob
+import hashlib
 import os
 import time
 
 import cv2
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -44,6 +46,16 @@ MODEL_CONFIGS = {
 }
 
 IMG_EXTS = ('.jpg', '.jpeg', '.png', '.bmp', '.webp', '.tif', '.tiff')
+
+
+def teacher_cache_path(cache_dir, img_path, input_size):
+    """Deterministic cache file for an image's teacher target at a given resolution.
+
+    Keyed on absolute path + input_size so a different resolution never collides with
+    a stale cache. Both precompute_teacher.py and training use this same function.
+    """
+    key = hashlib.md5(f'{os.path.abspath(img_path)}|{input_size}'.encode()).hexdigest()
+    return os.path.join(cache_dir, key + '.npy')
 
 
 # --------------------------------------------------------------------------------------
@@ -103,10 +115,13 @@ class UnlabeledImageDataset(Dataset):
     Uses a fixed square resize (default 518 = 37 x 14) so samples can be batched.
     """
 
-    def __init__(self, data_dir, input_size=518, cache_path=None, rebuild_cache=False):
+    def __init__(self, data_dir, input_size=518, cache_path=None, rebuild_cache=False,
+                 teacher_cache=None):
         self.files = self._load_file_list(data_dir, cache_path, rebuild_cache)
         if not self.files:
             raise FileNotFoundError(f'No images found under {data_dir}')
+        self.input_size = input_size
+        self.teacher_cache = teacher_cache       # dir of precomputed targets, or None
 
         self.transform = Compose([
             Resize(
@@ -156,8 +171,18 @@ class UnlabeledImageDataset(Dataset):
         if img is None:                          # skip unreadable file
             return self.__getitem__((i + 1) % len(self.files))
         img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB) / 255.0
-        img = self.transform({'image': img})['image']
-        return torch.from_numpy(img)
+        img = torch.from_numpy(self.transform({'image': img})['image'])
+
+        if self.teacher_cache is None:
+            return img
+
+        path = teacher_cache_path(self.teacher_cache, self.files[i], self.input_size)
+        if not os.path.exists(path):
+            raise FileNotFoundError(
+                f'No teacher cache for {self.files[i]} at {path}. '
+                f'Run precompute_teacher.py with the same --input-size first.')
+        target = torch.from_numpy(np.load(path).astype('float32'))
+        return img, target
 
 
 # --------------------------------------------------------------------------------------
@@ -252,7 +277,10 @@ def parse_args():
     p.add_argument('--rebuild-filelist', action='store_true', help='force a rescan, ignoring any cache')
     p.add_argument('--teacher-encoder', type=str, default='vitl', choices=list(MODEL_CONFIGS))
     p.add_argument('--student-encoder', type=str, default='vits', choices=list(MODEL_CONFIGS))
-    p.add_argument('--teacher-ckpt', type=str, required=True)
+    p.add_argument('--teacher-ckpt', type=str, default=None,
+                   help='required unless --teacher-cache is given')
+    p.add_argument('--teacher-cache', type=str, default=None,
+                   help='dir of precomputed teacher targets (skips running the teacher live)')
     p.add_argument('--student-ckpt', type=str, default=None, help='optional warm-start for the student')
     p.add_argument('--quantize', action='store_true', help='swap student DINOv2 linears for BitLinear')
     p.add_argument('--input-size', type=int, default=518)
@@ -285,10 +313,18 @@ def main():
     use_scaler = use_amp and amp_dtype == torch.float16
     print(f'Device: {device} | AMP: {use_amp} ({args.amp_dtype if use_amp else "off"})')
 
-    # Teacher: frozen, eval.
-    teacher = build_model(args.teacher_encoder, args.teacher_ckpt, device).eval()
-    for prm in teacher.parameters():
-        prm.requires_grad_(False)
+    if not args.teacher_cache and not args.teacher_ckpt:
+        raise SystemExit('Provide --teacher-ckpt (live teacher) or --teacher-cache (precomputed).')
+
+    # Teacher: only needed when targets are computed live. With --teacher-cache the
+    # ViT-L is never loaded, so we save its memory and per-step compute entirely.
+    teacher = None
+    if not args.teacher_cache:
+        teacher = build_model(args.teacher_encoder, args.teacher_ckpt, device).eval()
+        for prm in teacher.parameters():
+            prm.requires_grad_(False)
+    else:
+        print(f'Using precomputed teacher targets from {args.teacher_cache}')
 
     # Student: optionally quantized, trainable.
     student = build_model(args.student_encoder, args.student_ckpt, device)
@@ -300,6 +336,7 @@ def main():
     dataset = UnlabeledImageDataset(
         args.data_dir, args.input_size,
         cache_path=args.filelist_cache, rebuild_cache=args.rebuild_filelist,
+        teacher_cache=args.teacher_cache,
     )
     loader = DataLoader(
         dataset, batch_size=args.bs, shuffle=True, num_workers=args.num_workers,
@@ -323,10 +360,14 @@ def main():
     t_log = time.perf_counter()                    # wall-clock anchor for step timing
     for epoch in range(args.epochs):
         for batch in loader:
-            x = batch.to(device, non_blocking=True)
-
-            with torch.no_grad(), torch.autocast(device_type='cuda', dtype=amp_dtype, enabled=use_amp):
-                target = teacher(x)
+            if args.teacher_cache:                 # (image, precomputed target)
+                x, target = batch
+                x = x.to(device, non_blocking=True)
+                target = target.to(device, non_blocking=True)
+            else:                                  # compute the target live
+                x = batch.to(device, non_blocking=True)
+                with torch.no_grad(), torch.autocast(device_type='cuda', dtype=amp_dtype, enabled=use_amp):
+                    target = teacher(x)
 
             with torch.autocast(device_type='cuda', dtype=amp_dtype, enabled=use_amp):
                 pred = student(x)
