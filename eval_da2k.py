@@ -27,8 +27,9 @@ import cv2
 import numpy as np
 import torch
 
+from bitnet import convert_linear_to_bitlinear
 from depth_anything_v2.dpt import DepthAnythingV2
-from train_distill import MODEL_CONFIGS, convert_linear_to_bitlinear
+from train_distill import MODEL_CONFIGS
 
 
 class DA2KSource:

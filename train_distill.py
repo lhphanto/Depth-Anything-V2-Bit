@@ -30,10 +30,10 @@ import cv2
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from torchvision.transforms import Compose
 
+from bitnet import convert_linear_to_bitlinear
 from depth_anything_v2.dpt import DepthAnythingV2
 from depth_anything_v2.util.transform import Resize, NormalizeImage, PrepareForNet
 
@@ -56,54 +56,6 @@ def teacher_cache_path(cache_dir, img_path, input_size):
     """
     key = hashlib.md5(f'{os.path.abspath(img_path)}|{input_size}'.encode()).hexdigest()
     return os.path.join(cache_dir, key + '.npy')
-
-
-# --------------------------------------------------------------------------------------
-# 1.58-bit quantization placeholder
-# --------------------------------------------------------------------------------------
-class BitLinear(nn.Linear):
-    """Drop-in replacement for nn.Linear, ready for 1.58-bit (ternary) quantization.
-
-    For now this is a pass-through identical to nn.Linear, so the student trains in full
-    precision as a placeholder. Fill in the two hooks below with your BitNet b1.58
-    implementation later; the rest of the pipeline does not need to change.
-    """
-
-    def _quantize_weight(self, w):
-        # TODO(1.58-bit): ternarize weights to {-1, 0, 1} with absmean scaling, e.g.
-        #     scale = w.abs().mean().clamp_min(1e-5)
-        #     w_q   = (w / scale).round().clamp(-1, 1) * scale
-        #     return w + (w_q - w).detach()        # straight-through estimator
-        return w
-
-    def _quantize_activation(self, x):
-        # TODO(1.58-bit): per-token absmax int8 quantization of the activations.
-        return x
-
-    def forward(self, x):
-        x = self._quantize_activation(x)
-        w = self._quantize_weight(self.weight)
-        return F.linear(x, w, self.bias)
-
-
-def convert_linear_to_bitlinear(module):
-    """Recursively swap every nn.Linear in `module` for a BitLinear, reusing weights.
-
-    Pass `student.pretrained` to quantize only the DINOv2 encoder linear layers.
-    Returns the number of layers replaced.
-    """
-    n = 0
-    for name, child in list(module.named_children()):
-        if isinstance(child, nn.Linear) and not isinstance(child, BitLinear):
-            new = BitLinear(child.in_features, child.out_features, bias=child.bias is not None)
-            new.weight = child.weight
-            if child.bias is not None:
-                new.bias = child.bias
-            setattr(module, name, new)
-            n += 1
-        else:
-            n += convert_linear_to_bitlinear(child)
-    return n
 
 
 # --------------------------------------------------------------------------------------
