@@ -34,7 +34,7 @@ import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 from torchvision.transforms import Compose
 
-from bitnet import convert_linear_to_bitlinear
+from bitnet import convert_linear_to_bitlinear, pack_model_for_storage
 from depth_anything_v2.dpt import DepthAnythingV2
 from depth_anything_v2.util.transform import Resize, NormalizeImage, PrepareForNet
 
@@ -428,6 +428,14 @@ def main():
     final = os.path.join(args.save_path, 'student_final.pth')
     torch.save(student.state_dict(), final)
     logger.info('Done. Final student: %s', final)
+
+    # For a quantized student, also save a bit-packed 1.58-bit checkpoint (~8x smaller
+    # weights). This mutates the student (drops fp weights), so do it after the fp save.
+    if args.quantize:
+        n = pack_model_for_storage(student.pretrained)
+        packed = os.path.join(args.save_path, 'student_packed.pth')
+        torch.save(student.state_dict(), packed)
+        logger.info('Packed %d BitLinear layers -> %s', n, packed)
 
     plot_loss(loss_log, args.save_path)
 
