@@ -56,7 +56,32 @@ def parse_args():
     p.add_argument('--warmup', type=int, default=20)
     p.add_argument('--topk', type=int, default=20, help='# schedule candidates to tune over')
     p.add_argument('--atol', type=float, default=1e-1, help='max abs error in the numeric check')
+    p.add_argument('--debug', action='store_true',
+                   help='enable BitBLAS DEBUG logging to surface the real (swallowed) tuning error')
+    p.add_argument('--smoke', action='store_true',
+                   help='only run a plain fp16xfp16 BitBLAS matmul to test whether the install '
+                        'can tune ANYTHING (isolates env/version problems from low-bit configs)')
     return p.parse_args()
+
+
+def smoke_test(M, N, K, topk):
+    """Build+tune a plain fp16 BitBLAS matmul. If this fails, the install/version is broken,
+    not your low-bit config."""
+    import bitblas
+    print(f'\n[smoke] plain fp16 matmul (M={M}, N={N}, K={K})...')
+    cfg = dict(A_dtype='float16', W_dtype='float16', accum_dtype='float16', out_dtype='float16')
+    try:
+        op = build_op(cfg, M, N, K, topk)
+        x = torch.randn(M, K, device='cuda', dtype=torch.float16)
+        w = torch.randn(N, K, device='cuda', dtype=torch.float16)
+        out = op(x, op.transform_weight(w))
+        err = (out.float() - x.float() @ w.float().t()).abs().max().item()
+        print(f'[smoke] OK -- fp16 matmul tuned and ran (max_err={err:.4g}). '
+              f'The install works; the low-bit templates are the problem.')
+    except Exception as e:
+        print(f'[smoke] FAILED: {type(e).__name__}: {str(e)[:200]}')
+        print('[smoke] BitBLAS cannot tune even fp16 -> install/version issue '
+              '(likely incompatible with your CUDA/torch). See notes.')
 
 
 def build_op(cfg_kwargs, M, N, K, topk):
@@ -170,6 +195,19 @@ def main():
               f'torch {torch.__version__} | GPU {torch.cuda.get_device_name(0)}')
     except ImportError:
         raise SystemExit('bitblas not installed. pip install bitblas (pulls a TVM build).')
+
+    if args.debug:
+        for setter in ('set_log_level', 'set_debug_level'):
+            if hasattr(bitblas, setter):
+                getattr(bitblas, setter)('DEBUG')
+                break
+        else:
+            import logging
+            logging.getLogger('bitblas').setLevel(logging.DEBUG)
+
+    if args.smoke:
+        smoke_test(args.M, args.N or 1152, args.K or 384, args.topk)
+        return
 
     variants = [v for v in VARIANTS if not args.only or v['name'] == args.only]
     if not variants:
