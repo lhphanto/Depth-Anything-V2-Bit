@@ -32,10 +32,31 @@ from depth_anything_v2.dpt import DepthAnythingV2
 from train_distill import MODEL_CONFIGS
 
 
+def resolve_data_root(data_root):
+    """Turn `data_root` into a usable local path.
+
+    A local path (a DA-2K.zip or an extracted dir) is returned as-is. Otherwise it is
+    treated as a Hugging Face dataset repo id (e.g. 'depth-anything/DA-2K') and the
+    DA-2K.zip is resolved from / downloaded to the HF cache. This follows the
+    refs/main -> snapshots/<hash> symlink, so no commit hash is hardcoded.
+    """
+    if os.path.exists(data_root):
+        return data_root
+    try:
+        from huggingface_hub import hf_hub_download
+    except ImportError as e:
+        raise SystemExit(
+            f'--data-root {data_root!r} is not a local path and huggingface_hub is not '
+            f'installed to resolve it as a repo id ({e}). pip install huggingface_hub.')
+    print(f'{data_root!r} is not a local path; resolving as a HF dataset repo id...')
+    return hf_hub_download(data_root, 'DA-2K.zip', repo_type='dataset')
+
+
 class DA2KSource:
     """Reads annotations.json and images from either a DA-2K.zip or an extracted dir."""
 
     def __init__(self, data_root):
+        data_root = resolve_data_root(data_root)
         self.zip = None
         if data_root.endswith('.zip'):
             self.zip = zipfile.ZipFile(data_root, 'r')
@@ -70,7 +91,9 @@ def parse_args():
     p = argparse.ArgumentParser(description='DA-2K evaluation')
     p.add_argument('--checkpoint', type=str, required=True, help='student .pth to evaluate')
     p.add_argument('--encoder', type=str, default='vits', choices=list(MODEL_CONFIGS))
-    p.add_argument('--data-root', type=str, required=True, help='DA-2K.zip or extracted DA-2K dir')
+    p.add_argument('--data-root', type=str, required=True,
+                   help='DA-2K.zip, an extracted DA-2K dir, or a HF dataset repo id '
+                        '(e.g. depth-anything/DA-2K) to resolve from the HF cache')
     p.add_argument('--input-size', type=int, default=518)
     p.add_argument('--quantize', action='store_true',
                    help='swap encoder linears for BitLinear before loading (match a quantized checkpoint)')
