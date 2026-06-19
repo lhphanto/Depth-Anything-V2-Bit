@@ -23,6 +23,7 @@ Example
 import argparse
 import glob
 import hashlib
+import logging
 import os
 import time
 
@@ -46,6 +47,8 @@ MODEL_CONFIGS = {
 }
 
 IMG_EXTS = ('.jpg', '.jpeg', '.png', '.bmp', '.webp', '.tif', '.tiff')
+
+logger = logging.getLogger('distill')
 
 
 def teacher_cache_path(cache_dir, img_path, input_size):
@@ -99,10 +102,10 @@ class UnlabeledImageDataset(Dataset):
         if os.path.exists(cache_path) and not rebuild_cache:
             with open(cache_path) as f:
                 files = [line.rstrip('\n') for line in f if line.strip()]
-            print(f'Loaded {len(files)} image paths from cache {cache_path}')
+            logger.info('Loaded %d image paths from cache %s', len(files), cache_path)
             return files
 
-        print(f'Scanning {data_dir} for images (first run; will be cached)...')
+        logger.info('Scanning %s for images (first run; will be cached)...', data_dir)
         files = sorted(
             f for f in glob.glob(os.path.join(data_dir, '**', '*'), recursive=True)
             if f.lower().endswith(IMG_EXTS)
@@ -110,9 +113,9 @@ class UnlabeledImageDataset(Dataset):
         try:
             with open(cache_path, 'w') as f:
                 f.write('\n'.join(files))
-            print(f'Cached {len(files)} image paths to {cache_path}')
+            logger.info('Cached %d image paths to %s', len(files), cache_path)
         except OSError as e:                         # e.g. read-only dataset dir
-            print(f'Could not write file-list cache ({e}); continuing without cache')
+            logger.warning('Could not write file-list cache (%s); continuing without cache', e)
         return files
 
     def __len__(self):
@@ -189,7 +192,7 @@ def plot_loss(loss_log, save_path):
         matplotlib.use('Agg')                      # headless / no display needed
         import matplotlib.pyplot as plt
     except ImportError:
-        print('matplotlib not available; skipping loss plot')
+        logger.warning('matplotlib not available; skipping loss plot')
         return
 
     steps = [s for s, _ in loss_log]
@@ -211,7 +214,7 @@ def plot_loss(loss_log, save_path):
     png_path = os.path.join(save_path, 'loss_curve.png')
     plt.savefig(png_path, dpi=150)
     plt.close()
-    print(f'Saved {png_path}')
+    logger.info('Saved %s', png_path)
 
 
 def build_model(encoder, ckpt, device):
@@ -240,7 +243,7 @@ def parse_args():
     p.add_argument('--lr', type=float, default=5e-6)
     p.add_argument('--weight-decay', type=float, default=0.01)
     p.add_argument('--epochs', type=int, default=1)
-    p.add_argument('--save-every-epochs', type=int, default=2, help='checkpoint cadence in epochs')
+    p.add_argument('--save-every-epochs', type=int, default=1, help='checkpoint cadence in epochs')
     p.add_argument('--max-steps', type=int, default=0, help='stop early after N optimizer steps (0 = no limit)')
     p.add_argument('--grad-weight', type=float, default=0.5)
     p.add_argument('--num-workers', type=int, default=8)
@@ -257,13 +260,25 @@ def main():
     args = parse_args()
     os.makedirs(args.save_path, exist_ok=True)
 
+    # Log to both console and a persistent train.log in the run dir. StreamHandler
+    # flushes per record, so output shows up immediately even when redirected to a file.
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s %(levelname)s %(message)s',
+        datefmt='%H:%M:%S',
+        handlers=[
+            logging.StreamHandler(),
+            logging.FileHandler(os.path.join(args.save_path, 'train.log')),
+        ],
+    )
+
     device = 'cuda' if torch.cuda.is_available() else \
              'mps' if torch.backends.mps.is_available() else 'cpu'
     use_amp = args.amp and device == 'cuda'
     amp_dtype = torch.bfloat16 if args.amp_dtype == 'bf16' else torch.float16
     # GradScaler is only needed for fp16; bf16 has fp32 range and doesn't require it.
     use_scaler = use_amp and amp_dtype == torch.float16
-    print(f'Device: {device} | AMP: {use_amp} ({args.amp_dtype if use_amp else "off"})')
+    logger.info('Device: %s | AMP: %s (%s)', device, use_amp, args.amp_dtype if use_amp else 'off')
 
     if not args.teacher_cache and not args.teacher_ckpt:
         raise SystemExit('Provide --teacher-ckpt (live teacher) or --teacher-cache (precomputed).')
@@ -276,13 +291,13 @@ def main():
         for prm in teacher.parameters():
             prm.requires_grad_(False)
     else:
-        print(f'Using precomputed teacher targets from {args.teacher_cache}')
+        logger.info('Using precomputed teacher targets from %s', args.teacher_cache)
 
     # Student: optionally quantized, trainable.
     student = build_model(args.student_encoder, args.student_ckpt, device)
     if args.quantize:
         n = convert_linear_to_bitlinear(student.pretrained)
-        print(f'Quantized {n} linear layers in the student DINOv2 encoder -> BitLinear')
+        logger.info('Quantized %d linear layers in the student DINOv2 encoder -> BitLinear', n)
     student.train()
 
     dataset = UnlabeledImageDataset(
@@ -296,7 +311,7 @@ def main():
         persistent_workers=args.num_workers > 0,   # don't respawn workers each epoch
         prefetch_factor=args.prefetch_factor if args.num_workers > 0 else None,
     )
-    print(f'Training images: {len(loader.dataset)} | steps/epoch: {len(loader)}')
+    logger.info('Training images: %d | steps/epoch: %d', len(loader.dataset), len(loader))
 
     criterion = AffineInvariantDistillLoss(grad_weight=args.grad_weight)
     optimizer = torch.optim.AdamW(
@@ -339,9 +354,8 @@ def main():
                 ms_per_step = (now - t_log) / args.log_every * 1000
                 img_per_s = args.bs / (ms_per_step / 1000)
                 t_log = now
-                print(f'epoch {epoch} step {step}/{total_steps} '
-                      f'loss {loss.item():.4f} lr {lr:.2e} '
-                      f'{ms_per_step:.0f} ms/step {img_per_s:.1f} img/s')
+                logger.info('epoch %d step %d/%d loss %.4f lr %.2e %.0f ms/step %.1f img/s',
+                            epoch, step, total_steps, loss.item(), lr, ms_per_step, img_per_s)
 
             if args.max_steps and step >= args.max_steps:
                 break
@@ -350,14 +364,14 @@ def main():
         if (epoch + 1) % args.save_every_epochs == 0 or epoch == args.epochs - 1:
             ckpt_path = os.path.join(args.save_path, f'student_epoch{epoch + 1}.pth')
             torch.save(student.state_dict(), ckpt_path)
-            print(f'Saved {ckpt_path}')
+            logger.info('Saved %s', ckpt_path)
 
         if args.max_steps and step >= args.max_steps:
             break
 
     final = os.path.join(args.save_path, 'student_final.pth')
     torch.save(student.state_dict(), final)
-    print(f'Done. Final student: {final}')
+    logger.info('Done. Final student: %s', final)
 
     plot_loss(loss_log, args.save_path)
 
