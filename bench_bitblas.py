@@ -46,14 +46,17 @@ def parse_args():
     p.add_argument('--K', type=int, default=None, help='in features (override the ViT-S preset)')
     p.add_argument('--iters', type=int, default=100)
     p.add_argument('--warmup', type=int, default=20)
+    p.add_argument('--topk', type=int, default=20,
+                   help='# of schedule candidates BitBLAS tunes over (higher = slower tune, '
+                        'possibly faster kernel)')
     p.add_argument('--atol', type=float, default=1e-1,
                    help='max abs error tolerated in the numeric check (int8 GEMM is exact, '
                         'but fp16 scale application introduces small rounding)')
     return p.parse_args()
 
 
-def build_op(M, N, K):
-    """Build a BitBLAS W2A8 GEMM operator. <<< BITBLAS API >>>"""
+def build_op(M, N, K, topk):
+    """Build + tune a BitBLAS W2A8 GEMM operator. <<< BITBLAS API >>>"""
     import bitblas
     config = bitblas.MatmulConfig(
         M=M, N=N, K=K,
@@ -67,8 +70,12 @@ def build_op(M, N, K):
         with_zeros=False,        # symmetric (no zero point) -- ternary is symmetric
         group_size=-1,           # one scale per output channel
     )
-    # enable_tuning=True tunes+caches a kernel for this exact shape (slow first run only).
-    return bitblas.Matmul(config=config)
+    op = bitblas.Matmul(config=config)
+    # W2A8 has no canned "default schedule", so we must hardware-aware tune to compile a
+    # kernel for this exact (M,N,K) on this GPU. Slow the first time (minutes), then cached.
+    print(f'  tuning (topk={topk}); first run is slow, result is cached...')
+    op.hardware_aware_finetune(topk=topk)
+    return op
 
 
 def call_op(op, x_int, packed, scale):
@@ -110,7 +117,7 @@ def run_shape(name, N, K, M, args):
     x_int = (x * act_s).round().clamp_(-128, 127).to(torch.int8)     # [M, K]
 
     # --- build op + pack weight ---
-    op = build_op(M, N, K)
+    op = build_op(M, N, K, args.topk)
     packed = op.transform_weight(w_int)                              # <<< BITBLAS API >>>
 
     # --- numeric check vs dense fp reference (same math the fake-quant path computes) ---
