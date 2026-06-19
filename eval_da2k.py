@@ -27,7 +27,7 @@ import cv2
 import numpy as np
 import torch
 
-from bitnet import convert_linear_to_bitlinear
+from bitnet import convert_linear_to_bitlinear, quantize_for_inference
 from depth_anything_v2.dpt import DepthAnythingV2
 from train_distill import MODEL_CONFIGS
 
@@ -74,6 +74,9 @@ def parse_args():
     p.add_argument('--input-size', type=int, default=518)
     p.add_argument('--quantize', action='store_true',
                    help='swap encoder linears for BitLinear before loading (match a quantized checkpoint)')
+    p.add_argument('--fold-inference', action='store_true',
+                   help='fold BitLinear weights to ternary ints and use the integer '
+                        'inference path (requires --quantize)')
     p.add_argument('--scene-type', type=str, default='',
                    help='restrict to one scene (indoor, outdoor, ...); empty = all')
     return p.parse_args()
@@ -86,11 +89,22 @@ def main():
     device = 'cuda' if torch.cuda.is_available() else \
              'mps' if torch.backends.mps.is_available() else 'cpu'
 
+    if args.fold_inference and not args.quantize:
+        raise SystemExit('--fold-inference requires --quantize')
+
     model = DepthAnythingV2(**MODEL_CONFIGS[args.encoder])
     if args.quantize:
         n = convert_linear_to_bitlinear(model.pretrained)
         print(f'Quantized {n} encoder linear layers -> BitLinear')
     model.load_state_dict(torch.load(args.checkpoint, map_location='cpu'))
+
+    # Fold to ternary integers AFTER loading the trained fp weights. The integer
+    # inference path is numerically equivalent to the fake-quant training path; this
+    # checks the deployment form gives the same DA-2K accuracy.
+    if args.fold_inference:
+        n = quantize_for_inference(model.pretrained)
+        print(f'Folded {n} BitLinear layers to ternary-int inference form')
+
     model = model.to(device).eval()
 
     source = DA2KSource(args.data_root)
