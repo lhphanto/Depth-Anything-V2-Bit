@@ -1,29 +1,25 @@
 """
-Microbenchmark: BitBLAS W2A8 (int2 weight x int8 activation) vs cuBLAS bf16, for the real
-linear-layer shapes of a ViT-S (DINOv2-small) encoder.
+Microbenchmark / config-prober: find a BitBLAS low-bit GEMM config that actually tunes on
+this box for the real ViT-S (DINOv2-small) encoder linear shapes, then time it vs cuBLAS bf16.
 
-This is "step 1" -- decide whether a maintained ternary GEMM is worth wiring into the
-distilled student before investing in the full integration. For each shape it:
+Background: BitBLAS's int8-activation x int2-weight path (true "W2A8") is lightly supported
+and may fail to tune ("No tuning config found"). Its flagship path is weight-only quant
+(int2 weight, fp16 activations = "W2A16"). So for each shape we try a LADDER of variants and
+use the first that builds, tunes, and matches a dense reference:
 
-  1. builds a BitBLAS Matmul op for (M, N, K),
-  2. ternarizes a random weight to {-1,0,1} (absmean scale) and packs it,
-  3. checks the W2A8 output matches a dense fp reference (so we know the kernel + scales
-     are wired correctly), and
-  4. times W2A8 (kernel-only and end-to-end incl. activation quant) vs torch bf16 matmul,
-     and reports the weight-memory ratio.
+    1. w2a8-i32 : A=int8,  W=int2 -> int32 accumulation, dequant in torch   (true W2A8)
+    2. w2a8-f16 : A=int8,  W=int2 -> float16                                  (true W2A8)
+    3. w2a16    : A=fp16,  W=int2, in-kernel scaling                          (weight-only)
 
-M defaults to 1370 = the ViT token count at 518x518 ((518/14)^2 + 1 cls token).
+M defaults to 1370 = ViT token count at 518x518 ((518/14)^2 + 1 cls token).
 
-IMPORTANT: BitBLAS's Python API drifts across releases. The calls marked `BITBLAS API`
-below (MatmulConfig fields, Matmul(...), transform_weight, the __call__ scale argument) may
-need small tweaks for your installed version -- the script prints bitblas.__version__ at
-startup so you can cross-check against its examples. Run this ON THE A100.
+The BitBLAS calls are marked `<<< BITBLAS API >>>`; the API drifts across releases. Run on A100.
 
 Examples
 --------
-    python bench_bitblas.py                       # all 4 ViT-S encoder shapes, M=1370
-    python bench_bitblas.py --M 2740              # e.g. batch of 2 images
-    python bench_bitblas.py --N 1536 --K 384      # one custom shape
+    python bench_bitblas.py                  # all 4 ViT-S shapes, M=1370, try all variants
+    python bench_bitblas.py --N 1536 --K 384 # one custom shape
+    python bench_bitblas.py --only w2a16     # only probe the weight-only variant
 """
 
 import argparse
@@ -38,62 +34,46 @@ VITS_SHAPES = [
     ('mlp.fc2',    384, 1536),
 ]
 
+# Variant ladder. `act` = how activations are fed; `scaling` = scale applied inside the kernel.
+VARIANTS = [
+    dict(name='w2a8-i32', act='int8', scaling=False,
+         cfg=dict(A_dtype='int8', W_dtype='int2', accum_dtype='int32', out_dtype='int32')),
+    dict(name='w2a8-f16', act='int8', scaling=False,
+         cfg=dict(A_dtype='int8', W_dtype='int2', accum_dtype='int32', out_dtype='float16')),
+    dict(name='w2a16', act='fp16', scaling=True,
+         cfg=dict(A_dtype='float16', W_dtype='int2', accum_dtype='float16', out_dtype='float16',
+                  group_size=-1)),
+]
+
 
 def parse_args():
-    p = argparse.ArgumentParser(description='BitBLAS W2A8 vs bf16 microbenchmark')
+    p = argparse.ArgumentParser(description='BitBLAS low-bit GEMM prober/benchmark')
     p.add_argument('--M', type=int, default=1370, help='token count (rows of the activation)')
     p.add_argument('--N', type=int, default=None, help='out features (override the ViT-S preset)')
     p.add_argument('--K', type=int, default=None, help='in features (override the ViT-S preset)')
+    p.add_argument('--only', type=str, default=None, help='probe only this variant name')
     p.add_argument('--iters', type=int, default=100)
     p.add_argument('--warmup', type=int, default=20)
-    p.add_argument('--topk', type=int, default=20,
-                   help='# of schedule candidates BitBLAS tunes over (higher = slower tune, '
-                        'possibly faster kernel)')
-    p.add_argument('--atol', type=float, default=1e-1,
-                   help='max abs error tolerated in the numeric check (int8 GEMM is exact, '
-                        'but fp16 scale application introduces small rounding)')
+    p.add_argument('--topk', type=int, default=20, help='# schedule candidates to tune over')
+    p.add_argument('--atol', type=float, default=1e-1, help='max abs error in the numeric check')
     return p.parse_args()
 
 
-def build_op(M, N, K, topk):
-    """Build + tune a BitBLAS int2xint8 -> int32 GEMM operator. <<< BITBLAS API >>>
-
-    We deliberately do NOT use in-kernel scaling (with_scaling=False): that path needs the
-    'i2_to_i8_scale_offset' decode template, which has no schedule in this BitBLAS build.
-    Instead the kernel returns the raw int32 accumulation and we apply the weight + activation
-    scales in PyTorch afterward (same as the hand-written BitNet kernel's `/s*ws`).
-    """
+def build_op(cfg_kwargs, M, N, K, topk):
+    """Build + tune a BitBLAS Matmul op. Raises if it cannot tune. <<< BITBLAS API >>>"""
     import bitblas
     config = bitblas.MatmulConfig(
-        M=M, N=N, K=K,
-        A_dtype='int8',          # activations: int8
-        W_dtype='int2',          # weights: signed 2-bit (covers ternary {-1,0,1})
-        accum_dtype='int32',     # int8 x int2 accumulates in int32
-        out_dtype='int32',       # return the raw accumulation; we dequantize outside
-        layout='nt',             # activation row-major, weight transposed (N,K)
-        with_bias=False,
-        with_scaling=False,      # no fused decode+scale template -> avoids the failing path
-        with_zeros=False,        # symmetric (ternary has no zero point)
-    )
-    # enable_tuning=True makes the constructor hardware-aware tune (compile a kernel for this
-    # exact (M,N,K) on this GPU) instead of giving up when no default schedule exists.
-    # Slow the first time (minutes), then cached to disk.
-    print(f'  building + tuning (topk={topk}); first run is slow, result is cached...')
+        M=M, N=N, K=K, layout='nt', with_bias=False, with_zeros=False, **cfg_kwargs)
     try:
-        op = bitblas.Matmul(config=config, enable_tuning=True, topk=topk)
-    except TypeError:                      # older/newer signature without these kwargs
+        op = bitblas.Matmul(config=config, enable_tuning=True)   # tunes during construction
+    except TypeError:
         op = bitblas.Matmul(config=config)
         op.hardware_aware_finetune(topk=topk)
     return op
 
 
-def call_op(op, x_int, packed):
-    """Invoke the int2xint8->int32 op. <<< BITBLAS API >>>"""
-    return op(x_int, packed)
-
-
 def bench(fn, iters, warmup):
-    """Return mean latency in microseconds using CUDA events."""
+    """Mean latency in microseconds via CUDA events."""
     for _ in range(warmup):
         fn()
     torch.cuda.synchronize()
@@ -107,63 +87,83 @@ def bench(fn, iters, warmup):
     return start.elapsed_time(end) / iters * 1e3   # ms -> us
 
 
-def run_shape(name, N, K, M, args):
-    device = 'cuda'
-    print(f'\n=== {name}  (M={M}, N={N}, K={K}) ===')
-
-    # --- ternary weight {-1,0,1} via absmean (BitNet b1.58), one global scalar scale ---
+def make_weight(N, K, device):
+    """Ternary {-1,0,1} weight (int8) + scalar absmean scale (BitNet b1.58)."""
     w_fp = torch.randn(N, K, device=device)
     s = 1.0 / w_fp.abs().mean().clamp_(min=1e-5)
-    w_int = (w_fp * s).round().clamp_(-1, 1).to(torch.int8)          # [N, K] in {-1,0,1}
-    w_scale = 1.0 / s                                               # = mean(|w|), scalar
+    w_int = (w_fp * s).round().clamp_(-1, 1).to(torch.int8)
+    return w_int, 1.0 / s                                   # w_int [N,K], w_scale scalar
 
-    # --- activations, per-token int8 quant ---
-    x = torch.randn(M, K, device=device, dtype=torch.float16)
-    act_s = 127.0 / x.abs().max(dim=-1, keepdim=True).values.clamp_(min=1e-5)   # [M, 1]
-    x_int = (x * act_s).round().clamp_(-128, 127).to(torch.int8)     # [M, K]
 
-    # --- build op + pack weight ---
-    op = build_op(M, N, K, args.topk)
-    packed = op.transform_weight(w_int)                              # <<< BITBLAS API >>>
+def try_variant(v, N, K, M, x, w_int, w_scale, args):
+    """Build+tune the op for variant `v`, check numerics, time it. Returns a result dict."""
+    device = x.device
+    op = build_op(v['cfg'], M, N, K, args.topk)
+    packed = op.transform_weight(w_int)                    # <<< BITBLAS API >>>
+    y_ref_dense = (x.float() @ w_int.float().t()) * w_scale   # [M,N], pre activation-scale
 
-    # --- numeric check vs dense fp reference (same math the fake-quant path computes) ---
-    # The kernel returns raw int32 accumulation; dequant = * w_scale / act_scale in torch.
-    acc = call_op(op, x_int, packed).float()                        # [M, N] int32 accumulation
-    y_bb = acc * w_scale / act_s
-    y_ref = (x_int.float() @ w_int.float().t()) * w_scale / act_s
+    if v['act'] == 'int8':
+        act_s = 127.0 / x.abs().max(dim=-1, keepdim=True).values.clamp_(min=1e-5)
+        x_int = (x * act_s).round().clamp_(-128, 127).to(torch.int8)
+        out = op(x_int, packed)                            # int32 or fp16 accumulation
+        y_bb = out.float() * w_scale / act_s
+        y_ref = y_ref_dense / act_s
+        call = lambda: op(x_int, packed)
+        def e2e():
+            a_s = 127.0 / x.abs().max(dim=-1, keepdim=True).values.clamp_(min=1e-5)
+            xi = (x * a_s).round().clamp_(-128, 127).to(torch.int8)
+            return op(xi, packed).float() * w_scale / a_s
+    else:                                                  # weight-only: fp16 activations
+        scale = torch.full((N, 1), float(w_scale), dtype=torch.float16, device=device)
+        try:
+            out = op(x, packed, scale)
+            call = lambda: op(x, packed, scale)
+        except TypeError:
+            out = op(x, packed, scale=scale)
+            call = lambda: op(x, packed, scale=scale)
+        y_bb = out.float()
+        y_ref = y_ref_dense
+        e2e = call                                         # no separate activation quant
+
     max_err = (y_bb - y_ref).abs().max().item()
     rel = max_err / (y_ref.abs().max().item() + 1e-9)
-    ok = max_err < args.atol
-    print(f'  numeric check: max_abs_err={max_err:.4g} (rel={rel:.2e})  '
-          f'{"OK" if ok else "MISMATCH -- check scale wiring / encoding"}')
-
-    # --- timing ---
-    w_bf16 = w_int.to(torch.bfloat16).t().contiguous()              # [K, N], cuBLAS bf16
-    x_bf16 = x.to(torch.bfloat16)
-
-    t_bf16 = bench(lambda: torch.matmul(x_bf16, w_bf16), args.iters, args.warmup)
-    t_kernel = bench(lambda: call_op(op, x_int, packed), args.iters, args.warmup)
-
-    def e2e():                                                      # incl. activation quant + dequant
-        a_s = 127.0 / x.abs().max(dim=-1, keepdim=True).values.clamp_(min=1e-5)
-        xi = (x * a_s).round().clamp_(-128, 127).to(torch.int8)
-        return call_op(op, xi, packed).float() * w_scale / a_s
+    t_kernel = bench(call, args.iters, args.warmup)
     t_e2e = bench(e2e, args.iters, args.warmup)
-
-    mem_bf16 = w_int.numel() * 2                                    # bf16 weight bytes
     mem_packed = packed.numel() * packed.element_size()
-    print(f'  bf16 matmul     : {t_bf16:8.2f} us')
-    print(f'  W2A8 kernel-only: {t_kernel:8.2f} us   ({t_bf16 / t_kernel:.2f}x vs bf16)')
-    print(f'  W2A8 end-to-end : {t_e2e:8.2f} us   ({t_bf16 / t_e2e:.2f}x vs bf16, incl act-quant)')
-    print(f'  weight memory   : bf16 {mem_bf16/1024:.1f} KiB -> packed {mem_packed/1024:.1f} KiB '
-          f'({mem_bf16 / max(mem_packed, 1):.2f}x smaller)')
+    return dict(max_err=max_err, rel=rel, t_kernel=t_kernel, t_e2e=t_e2e, mem_packed=mem_packed)
+
+
+def run_shape(name, N, K, M, args, variants):
+    device = 'cuda'
+    print(f'\n=== {name}  (M={M}, N={N}, K={K}) ===')
+    x = torch.randn(M, K, device=device, dtype=torch.float16)
+    w_int, w_scale = make_weight(N, K, device)
+
+    # bf16 baseline (what we run today)
+    w_bf16 = w_int.to(torch.bfloat16).t().contiguous()
+    t_bf16 = bench(lambda: torch.matmul(x.to(torch.bfloat16), w_bf16), args.iters, args.warmup)
+    mem_bf16 = w_int.numel() * 2
+    print(f'  bf16 matmul (baseline): {t_bf16:8.2f} us   weight {mem_bf16/1024:.1f} KiB')
+
+    for v in variants:
+        print(f'  -- variant {v["name"]} (tuning, topk={args.topk}; first run slow)...')
+        try:
+            r = try_variant(v, N, K, M, x, w_int, w_scale, args)
+        except Exception as e:
+            print(f'     FAILED: {type(e).__name__}: {str(e)[:160]}')
+            continue
+        ok = r['max_err'] < args.atol
+        print(f'     numeric: max_err={r["max_err"]:.4g} (rel={r["rel"]:.2e}) '
+              f'{"OK" if ok else "MISMATCH (encoding/scale)"}')
+        print(f'     kernel-only: {r["t_kernel"]:8.2f} us  ({t_bf16/r["t_kernel"]:.2f}x)  '
+              f'end-to-end: {r["t_e2e"]:8.2f} us  ({t_bf16/r["t_e2e"]:.2f}x)  '
+              f'weight {r["mem_packed"]/1024:.1f} KiB ({mem_bf16/max(r["mem_packed"],1):.2f}x smaller)')
 
 
 def main():
     args = parse_args()
     if not torch.cuda.is_available():
         raise SystemExit('This benchmark needs a CUDA GPU (run it on the A100).')
-
     try:
         import bitblas
         print(f'bitblas {getattr(bitblas, "__version__", "?")} | '
@@ -171,15 +171,17 @@ def main():
     except ImportError:
         raise SystemExit('bitblas not installed. pip install bitblas (pulls a TVM build).')
 
+    variants = [v for v in VARIANTS if not args.only or v['name'] == args.only]
+    if not variants:
+        raise SystemExit(f'--only {args.only!r} matched no variant; choose from '
+                         f'{[v["name"] for v in VARIANTS]}')
+
     shapes = ([('custom', args.N, args.K)] if args.N and args.K else VITS_SHAPES)
     for name, N, K in shapes:
-        try:
-            run_shape(name, N, K, args.M, args)
-        except Exception as e:                     # one bad shape shouldn't kill the sweep
-            print(f'  [error] {name} ({N}x{K}): {type(e).__name__}: {e}')
+        run_shape(name, N, K, args.M, args, variants)
 
-    print('\nDone. If kernel-only is <1x (slower) and you do not need the memory saving, '
-          'the W2A8 path is not worth wiring into ViT-S.')
+    print('\nDone. Use the first variant that prints OK. If only w2a16 works, BitBLAS '
+          'gives weight compression + weight-only speedup; true W2A8 is unsupported here.')
 
 
 if __name__ == '__main__':
