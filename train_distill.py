@@ -249,6 +249,9 @@ def parse_args():
     p.add_argument('--num-workers', type=int, default=8)
     p.add_argument('--prefetch-factor', type=int, default=4, help='batches prefetched per worker')
     p.add_argument('--log-every', type=int, default=50)
+    p.add_argument('--profile', action='store_true',
+                   help='log per-phase timing (data load / forward / backward); adds a '
+                        'device sync per phase, so throughput drops slightly while on')
     p.add_argument('--save-path', type=str, default='exp/distill')
     p.add_argument('--amp', action='store_true', help='mixed precision (CUDA only)')
     p.add_argument('--amp-dtype', type=str, default='bf16', choices=['bf16', 'fp16'],
@@ -322,10 +325,20 @@ def main():
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_steps)
     scaler = torch.amp.GradScaler('cuda', enabled=use_scaler)
 
+    def sync():
+        # Make queued GPU work finish so the clock reads true elapsed time. Kernels are
+        # async, so without this a phase's time would leak into whatever syncs next.
+        if device == 'cuda':
+            torch.cuda.synchronize()
+        elif device == 'mps':
+            torch.mps.synchronize()
+
     step = 0
     loss_log = []                                  # (step, loss) for every optimizer step
     t_log = time.perf_counter()                    # wall-clock anchor for step timing
+    data_t = fwd_t = bwd_t = 0.0                   # per-window phase accumulators (s)
     for epoch in range(args.epochs):
+        t_phase = time.perf_counter()              # start of the data wait for batch 0
         for batch in loader:
             if args.teacher_cache:                 # (image, precomputed target)
                 x, target = batch
@@ -335,16 +348,23 @@ def main():
                 x = batch.to(device, non_blocking=True)
                 with torch.no_grad(), torch.autocast(device_type='cuda', dtype=amp_dtype, enabled=use_amp):
                     target = teacher(x)
+            if args.profile:                       # data load = loader wait + H2D (+ teacher)
+                sync(); t1 = time.perf_counter(); data_t += t1 - t_phase
 
             with torch.autocast(device_type='cuda', dtype=amp_dtype, enabled=use_amp):
                 pred = student(x)
                 loss = criterion(pred, target)
+            if args.profile:                       # forward = student forward + loss
+                sync(); t2 = time.perf_counter(); fwd_t += t2 - t1
 
             optimizer.zero_grad(set_to_none=True)
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
             scheduler.step()
+            if args.profile:                       # backward = backward + optimizer step
+                sync(); t_phase = time.perf_counter(); bwd_t += t_phase - t2
+
             step += 1
             loss_log.append((step, loss.item()))
 
@@ -354,8 +374,19 @@ def main():
                 ms_per_step = (now - t_log) / args.log_every * 1000
                 img_per_s = args.bs / (ms_per_step / 1000)
                 t_log = now
-                logger.info('epoch %d step %d/%d loss %.4f lr %.2e %.0f ms/step %.1f img/s',
-                            epoch, step, total_steps, loss.item(), lr, ms_per_step, img_per_s)
+                if args.profile:
+                    d = data_t / args.log_every * 1000
+                    f = fwd_t / args.log_every * 1000
+                    b = bwd_t / args.log_every * 1000
+                    logger.info('epoch %d step %d/%d loss %.4f lr %.2e | %.0f ms/step %.1f img/s '
+                                '| data %.0f ms (%.0f%%) fwd %.0f ms (%.0f%%) bwd %.0f ms (%.0f%%)',
+                                epoch, step, total_steps, loss.item(), lr, ms_per_step, img_per_s,
+                                d, 100 * d / ms_per_step, f, 100 * f / ms_per_step,
+                                b, 100 * b / ms_per_step)
+                    data_t = fwd_t = bwd_t = 0.0
+                else:
+                    logger.info('epoch %d step %d/%d loss %.4f lr %.2e %.0f ms/step %.1f img/s',
+                                epoch, step, total_steps, loss.item(), lr, ms_per_step, img_per_s)
 
             if args.max_steps and step >= args.max_steps:
                 break
