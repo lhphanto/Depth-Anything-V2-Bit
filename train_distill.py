@@ -240,7 +240,10 @@ def parse_args():
     p.add_argument('--quantize', action='store_true', help='swap student DINOv2 linears for BitLinear')
     p.add_argument('--input-size', type=int, default=518)
     p.add_argument('--bs', type=int, default=4)
-    p.add_argument('--lr', type=float, default=5e-6)
+    p.add_argument('--lr', type=float, default=5e-5,
+                   help='learning rate for the DPT decoder head')
+    p.add_argument('--encoder-lr', type=float, default=5e-6,
+                   help='learning rate for the DINOv2 encoder (paper uses 10x lower than the head)')
     p.add_argument('--weight-decay', type=float, default=0.01)
     p.add_argument('--epochs', type=int, default=1)
     p.add_argument('--save-every-epochs', type=int, default=1, help='checkpoint cadence in epochs')
@@ -317,8 +320,30 @@ def main():
     logger.info('Training images: %d | steps/epoch: %d', len(loader.dataset), len(loader))
 
     criterion = AffineInvariantDistillLoss(grad_weight=args.grad_weight)
+    # Two LR groups, as in the Depth Anything paper: a small LR on the pretrained DINOv2
+    # encoder (it only needs gentle adaptation) and a 10x larger LR on the DPT head (trained
+    # from scratch). Split by parameter name: everything under `pretrained.` is the encoder,
+    # the rest (`depth_head.`) is the decoder.
+    encoder_named = [(n, p) for n, p in student.named_parameters()
+                     if p.requires_grad and n.startswith('pretrained.')]
+    decoder_named = [(n, p) for n, p in student.named_parameters()
+                     if p.requires_grad and not n.startswith('pretrained.')]
+    encoder_params = [p for _, p in encoder_named]
+    decoder_params = [p for _, p in decoder_named]
+    logger.info('Optimizer groups: encoder %d tensors @ lr %.2e | decoder %d tensors @ lr %.2e',
+                len(encoder_params), args.encoder_lr, len(decoder_params), args.lr)
+    # Log the full decoder group (small) and a sample of the encoder to verify the split.
+    logger.info('Decoder (head) params @ lr %.2e:', args.lr)
+    for n, _ in decoder_named:
+        logger.info('    %s', n)
+    if encoder_named:
+        logger.info('Encoder params @ lr %.2e (e.g. %s ... %s)',
+                    args.encoder_lr, encoder_named[0][0], encoder_named[-1][0])
     optimizer = torch.optim.AdamW(
-        (p for p in student.parameters() if p.requires_grad),
+        [
+            {'params': encoder_params, 'lr': args.encoder_lr},
+            {'params': decoder_params, 'lr': args.lr},
+        ],
         lr=args.lr, weight_decay=args.weight_decay,
     )
     total_steps = args.max_steps or args.epochs * len(loader)
