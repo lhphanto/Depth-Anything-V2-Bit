@@ -60,6 +60,11 @@ class DA2KSource:
         self.zip = None
         if data_root.endswith('.zip'):
             self.zip = zipfile.ZipFile(data_root, 'r')
+            # Map recovered-UTF-8 name -> the exact string zipfile.read() expects. Needed
+            # because some entries (non-ASCII names) were stored without the UTF-8 flag,
+            # so zipfile decoded them as CP437 and they no longer match the UTF-8 paths
+            # in annotations.json.
+            self.name_index = self._build_name_index(self.zip)
             self.prefix = self._find_prefix(self.zip.namelist())
             ann = self.zip.read(self.prefix + 'annotations.json')
             self.annotations = json.loads(ann)
@@ -79,10 +84,34 @@ class DA2KSource:
                 return n[: -len('annotations.json')]
         raise FileNotFoundError('annotations.json not found in zip')
 
+    @staticmethod
+    def _build_name_index(zf):
+        """Map each entry's true UTF-8 name -> the raw name zipfile.read() needs.
+
+        Entries flagged UTF-8 (bit 0x800) are already correct. Otherwise zipfile decoded
+        the name with CP437; round-tripping through CP437 bytes recovers the original
+        UTF-8 string, which is what annotations.json uses.
+        """
+        index = {}
+        for info in zf.infolist():
+            true_name = info.filename
+            if not info.flag_bits & 0x800:
+                try:
+                    true_name = info.filename.encode('cp437').decode('utf-8')
+                except (UnicodeEncodeError, UnicodeDecodeError):
+                    true_name = info.filename
+            index[true_name] = info.filename
+        return index
+
     def read_image(self, rel_path):
         """Return a BGR uint8 image for an annotation key like 'images/indoor/x.jpg'."""
         if self.zip is not None:
-            buf = self.zip.read(self.prefix + rel_path)
+            key = self.prefix + rel_path
+            raw_name = self.name_index.get(key, key)   # fall back to the literal key
+            try:
+                buf = self.zip.read(raw_name)
+            except KeyError:
+                return None                            # let the caller warn + skip
             return cv2.imdecode(np.frombuffer(buf, np.uint8), cv2.IMREAD_COLOR)
         return cv2.imread(os.path.join(self.dir, rel_path))
 
