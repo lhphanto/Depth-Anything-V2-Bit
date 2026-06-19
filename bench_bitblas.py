@@ -56,34 +56,40 @@ def parse_args():
 
 
 def build_op(M, N, K, topk):
-    """Build + tune a BitBLAS W2A8 GEMM operator. <<< BITBLAS API >>>"""
+    """Build + tune a BitBLAS int2xint8 -> int32 GEMM operator. <<< BITBLAS API >>>
+
+    We deliberately do NOT use in-kernel scaling (with_scaling=False): that path needs the
+    'i2_to_i8_scale_offset' decode template, which has no schedule in this BitBLAS build.
+    Instead the kernel returns the raw int32 accumulation and we apply the weight + activation
+    scales in PyTorch afterward (same as the hand-written BitNet kernel's `/s*ws`).
+    """
     import bitblas
     config = bitblas.MatmulConfig(
         M=M, N=N, K=K,
         A_dtype='int8',          # activations: int8
         W_dtype='int2',          # weights: signed 2-bit (covers ternary {-1,0,1})
         accum_dtype='int32',     # int8 x int2 accumulates in int32
-        out_dtype='float16',     # dequantized output
+        out_dtype='int32',       # return the raw accumulation; we dequantize outside
         layout='nt',             # activation row-major, weight transposed (N,K)
         with_bias=False,
-        with_scaling=True,       # apply a per-output-channel weight scale inside the kernel
-        with_zeros=False,        # symmetric (no zero point) -- ternary is symmetric
-        group_size=-1,           # one scale per output channel
+        with_scaling=False,      # no fused decode+scale template -> avoids the failing path
+        with_zeros=False,        # symmetric (ternary has no zero point)
     )
-    op = bitblas.Matmul(config=config)
-    # W2A8 has no canned "default schedule", so we must hardware-aware tune to compile a
-    # kernel for this exact (M,N,K) on this GPU. Slow the first time (minutes), then cached.
-    print(f'  tuning (topk={topk}); first run is slow, result is cached...')
-    op.hardware_aware_finetune(topk=topk)
+    # enable_tuning=True makes the constructor hardware-aware tune (compile a kernel for this
+    # exact (M,N,K) on this GPU) instead of giving up when no default schedule exists.
+    # Slow the first time (minutes), then cached to disk.
+    print(f'  building + tuning (topk={topk}); first run is slow, result is cached...')
+    try:
+        op = bitblas.Matmul(config=config, enable_tuning=True, topk=topk)
+    except TypeError:                      # older/newer signature without these kwargs
+        op = bitblas.Matmul(config=config)
+        op.hardware_aware_finetune(topk=topk)
     return op
 
 
-def call_op(op, x_int, packed, scale):
-    """Invoke the op, tolerating the two common __call__ signatures. <<< BITBLAS API >>>"""
-    try:
-        return op(x_int, packed, scale=scale)
-    except TypeError:
-        return op(x_int, packed, scale)
+def call_op(op, x_int, packed):
+    """Invoke the int2xint8->int32 op. <<< BITBLAS API >>>"""
+    return op(x_int, packed)
 
 
 def bench(fn, iters, warmup):
@@ -109,7 +115,7 @@ def run_shape(name, N, K, M, args):
     w_fp = torch.randn(N, K, device=device)
     s = 1.0 / w_fp.abs().mean().clamp_(min=1e-5)
     w_int = (w_fp * s).round().clamp_(-1, 1).to(torch.int8)          # [N, K] in {-1,0,1}
-    w_scale = (1.0 / s).to(torch.float16).expand(N).contiguous()    # per-channel (all equal)
+    w_scale = 1.0 / s                                               # = mean(|w|), scalar
 
     # --- activations, per-token int8 quant ---
     x = torch.randn(M, K, device=device, dtype=torch.float16)
@@ -121,8 +127,10 @@ def run_shape(name, N, K, M, args):
     packed = op.transform_weight(w_int)                              # <<< BITBLAS API >>>
 
     # --- numeric check vs dense fp reference (same math the fake-quant path computes) ---
-    y_bb = call_op(op, x_int, packed, w_scale).float() / act_s
-    y_ref = (x_int.float() @ w_int.float().t()) * (1.0 / s) / act_s
+    # The kernel returns raw int32 accumulation; dequant = * w_scale / act_scale in torch.
+    acc = call_op(op, x_int, packed).float()                        # [M, N] int32 accumulation
+    y_bb = acc * w_scale / act_s
+    y_ref = (x_int.float() @ w_int.float().t()) * w_scale / act_s
     max_err = (y_bb - y_ref).abs().max().item()
     rel = max_err / (y_ref.abs().max().item() + 1e-9)
     ok = max_err < args.atol
@@ -134,12 +142,12 @@ def run_shape(name, N, K, M, args):
     x_bf16 = x.to(torch.bfloat16)
 
     t_bf16 = bench(lambda: torch.matmul(x_bf16, w_bf16), args.iters, args.warmup)
-    t_kernel = bench(lambda: call_op(op, x_int, packed, w_scale), args.iters, args.warmup)
+    t_kernel = bench(lambda: call_op(op, x_int, packed), args.iters, args.warmup)
 
-    def e2e():                                                      # incl. activation quant
+    def e2e():                                                      # incl. activation quant + dequant
         a_s = 127.0 / x.abs().max(dim=-1, keepdim=True).values.clamp_(min=1e-5)
         xi = (x * a_s).round().clamp_(-128, 127).to(torch.int8)
-        return call_op(op, xi, packed, w_scale).float() / a_s
+        return call_op(op, xi, packed).float() * w_scale / a_s
     t_e2e = bench(e2e, args.iters, args.warmup)
 
     mem_bf16 = w_int.numel() * 2                                    # bf16 weight bytes
