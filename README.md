@@ -19,6 +19,27 @@ This work presents Depth Anything V2. It significantly outperforms [V1](https://
 
 ![teaser](assets/teaser.png)
 
+---
+
+## 🔹 This fork: 1.58-bit (ternary) distilled student
+
+This fork (`Depth-Anything-V2-Bit`) distills a **BitNet b1.58 ternary-quantized DAV2-Small
+student** from a frozen full-precision DAV2-Large teacher on unlabeled images, to study how far
+1.58-bit weights can be pushed for monocular depth.
+
+- **Performance evaluation report:** see [`REPORT_1p58bit.md`](REPORT_1p58bit.md) for the full
+  DA-2K accuracy comparison (full-precision vs 1.58-bit) and the GPU/CPU latency analysis.
+  **Headline:** ternary quantization costs only **−0.0082 DA-2K accuracy** (0.6489 → 0.6407,
+  −1.3% relative) for ~8×-compressible encoder weights.
+- **Checkpoints / weights:** both the full-precision baseline and the 1.58-bit student are
+  released on the Hugging Face Hub at
+  **[lhphanto/depth-anything-v2-small-1p58bit](https://huggingface.co/lhphanto/depth-anything-v2-small-1p58bit)**.
+- **Fork-specific scripts:** `train_distill.py` (distillation training), `bitnet.py` (ternary
+  `BitLinear` + storage packing), `eval_da2k.py` (DA-2K evaluation), and the latency benchmarks
+  `triton_w8a8.py` / `bench_bitblas.py` / `bench_cpu_ternary.py`.
+
+---
+
 
 ## News
 - **2025-01-22:** [Video Depth Anything](https://videodepthanything.github.io) has been released. It generates consistent depth maps for super-long videos (e.g., over 5 minutes).
